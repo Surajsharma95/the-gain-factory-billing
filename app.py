@@ -1053,8 +1053,15 @@ Whey Protein Gold Standard,2800,3499,50
                 elif val <= 15:
                     return "background-color: rgba(251,146,60,0.2); color: #fb923c"
                 return ""
+            # Version-safe Pandas Styler mapping (Pandas 2.0 uses .map, older uses .applymap)
+            df_styled = df_p.style
+            if hasattr(df_styled, "map"):
+                df_styled = df_styled.map(highlight_stock, subset=["Stock"])
+            else:
+                df_styled = df_styled.applymap(highlight_stock, subset=["Stock"])
+
             st.dataframe(
-                df_p.style.applymap(highlight_stock, subset=["Stock"]),
+                df_styled,
                 use_container_width=True, hide_index=True
             )
             st.caption("⚠️ Buying price is internal — never shown on customer invoices.")
