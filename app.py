@@ -21,16 +21,23 @@ import urllib.parse
 def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-def _check_credentials(username: str, password: str) -> bool:
-    """Validate login. Reads from st.secrets on cloud, falls back to defaults locally."""
+def _check_credentials(username: str, password: str):
+    """Validate login. Reads from DB first, then falls back to secrets / local defaults."""
+    user = db.verify_user(username, password)
+    if user:
+        return True, user["role"], user["username"]
+        
     try:
         valid_user = st.secrets["credentials"]["username"]
         valid_hash = st.secrets["credentials"]["password_hash"]
+        if username.strip() == valid_user and _hash(password) == valid_hash:
+            return True, "admin", valid_user
     except Exception:
-        # Local dev fallback
-        valid_user = "admin"
-        valid_hash = _hash("gainfactory2024")
-    return username.strip() == valid_user and _hash(password) == valid_hash
+        # Fallback for first-time local setup
+        if username.strip() == "admin" and password == "gainfactory2024":
+            return True, "admin", "admin"
+            
+    return False, None, None
 
 
 def build_whatsapp_message(inv, items):
@@ -138,8 +145,11 @@ if not st.session_state.authenticated:
             login_pass = st.text_input("🔒 Password", type="password", key="login_pass", placeholder="Enter password")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🔓 Login", use_container_width=True, type="primary"):
-                if _check_credentials(login_user, login_pass):
+                ok, role, name = _check_credentials(login_user, login_pass)
+                if ok:
                     st.session_state.authenticated = True
+                    st.session_state.role = role
+                    st.session_state.username = name
                     st.rerun()
                 else:
                     st.error("❌ Invalid username or password.")
@@ -301,9 +311,14 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    # Admin menu vs Staff menu
+    menu_options = ["🏠 Dashboard", "🧾 New Invoice", "📋 Invoice History", "📦 Products", "👥 Customers"]
+    if st.session_state.get("role") == "admin":
+        menu_options.append("👤 Users")
+
     page = st.radio(
         "Navigate",
-        ["🏠 Dashboard", "🧾 New Invoice", "📋 Invoice History", "📦 Products", "👥 Customers"],
+        menu_options,
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -938,21 +953,100 @@ elif page == "📦 Products":
     st.markdown("""
     <div class='main-header'>
         <h1>📦 Product Inventory</h1>
-        <p>The Gain Factory — Manage your supplement catalog and stock levels</p>
+        <p>The Gain Factory — Edit prices &amp; stock inline, or bulk-upload a CSV</p>
     </div>
     """, unsafe_allow_html=True)
 
     products = db.get_all_products()
 
+    # ── 1. Inline Editable Table ──
+    st.markdown("<div class='section-header'>✏️ Edit Buying Price, Selling Price &amp; Stock</div>",
+                unsafe_allow_html=True)
+    st.caption("Click any price or stock cell to edit. Press Enter to confirm, then click 💾 Save.")
+
+    if products:
+        df_edit = pd.DataFrame(products)[["id", "name", "brand", "buying_price", "price", "stock"]].copy()
+        df_edit.columns = ["ID", "Product", "Brand", "Buying Price (₹)", "Selling Price (₹)", "Stock"]
+
+        edited = st.data_editor(
+            df_edit,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["ID", "Product", "Brand"],
+            column_config={
+                "ID":                  st.column_config.NumberColumn("ID", width="small"),
+                "Product":             st.column_config.TextColumn("Product", width="large"),
+                "Brand":               st.column_config.TextColumn("Brand"),
+                "Buying Price (₹)":  st.column_config.NumberColumn("Buying ₹",  min_value=0, step=10, format="₹%.2f"),
+                "Selling Price (₹)": st.column_config.NumberColumn("Selling ₹", min_value=0, step=10, format="₹%.2f"),
+                "Stock":               st.column_config.NumberColumn("Stock", min_value=0, step=1),
+            },
+            key="product_editor",
+        )
+
+        if st.button("💾 Save All Changes to Database", type="primary"):
+            for _, row in edited.iterrows():
+                db.update_product(
+                    int(row["ID"]),
+                    float(row["Buying Price (₹)"]),
+                    float(row["Selling Price (₹)"]),
+                    int(row["Stock"]),
+                )
+            st.success(f"✅ All {len(edited)} product(s) saved to database!")
+            st.rerun()
+
+    # ── 2. CSV Bulk Upload ──
+    st.markdown("<div class='section-header'>📂 Bulk Update via CSV</div>", unsafe_allow_html=True)
+    with st.expander("📋 CSV Format — click to expand"):
+        st.markdown("""
+**Required column:** `name` (case-insensitive match)
+
+**Optional columns:**
+
+| Column | Description |
+|--------|-------------|
+| `buying_price` | Your cost price |
+| `selling_price` | Customer price |
+| `stock` | Stock quantity |
+
+**Example:**
+```
+name,buying_price,selling_price,stock
+Whey Protein Gold Standard,2800,3499,50
+```
+        """)
+
+    csv_file = st.file_uploader("Upload CSV to update prices / stock", type=["csv"], key="csv_upload")
+    if csv_file is not None:
+        try:
+            df_csv = pd.read_csv(csv_file)
+            df_csv.columns = [c.strip().lower().replace(" ", "_") for c in df_csv.columns]
+            st.markdown("**Preview:**")
+            st.dataframe(df_csv.head(10), use_container_width=True, hide_index=True)
+            if st.button("⚡ Apply CSV Updates to Database", type="primary", key="apply_csv"):
+                rows = df_csv.to_dict("records")
+                updated, skipped = db.bulk_update_products_csv(rows)
+                if updated:
+                    st.success(f"✅ Updated {updated} product(s)!")
+                if skipped:
+                    st.warning(f"⚠️ {skipped} row(s) skipped — name not found in DB.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ Error reading CSV: {e}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
     col_left, col_right = st.columns([3, 2])
+
+    # ── 3. Inventory Summary ──
     with col_left:
-        st.markdown("<div class='section-header'>📋 All Products</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-header'>📋 Current Inventory</div>", unsafe_allow_html=True)
         if products:
-            df_p = pd.DataFrame(products)
+            df_p = pd.DataFrame(db.get_all_products())
             df_p = df_p[["name", "brand", "category", "buying_price", "price", "stock", "unit"]]
-            df_p.columns = ["Product", "Brand", "Category", "Buying Price (₹)", "Selling Price (₹)", "Stock", "Unit"]
-            df_p["Margin (₹)"] = df_p["Selling Price (₹)"] - df_p["Buying Price (₹)"]
-            df_p["Margin %"] = ((df_p["Margin (₹)"] / df_p["Buying Price (₹)"]) * 100).round(1).astype(str) + "%"
+            df_p.columns = ["Product", "Brand", "Category", "Buying (₹)", "Selling (₹)", "Stock", "Unit"]
+            df_p["Margin (₹)"] = df_p["Selling (₹)"] - df_p["Buying (₹)"]
+            df_p["Margin %"] = ((df_p["Margin (₹)"] / df_p["Buying (₹)"]) * 100).round(1).astype(str) + "%"
             def highlight_stock(val):
                 if val <= 5:
                     return "background-color: rgba(239,68,68,0.2); color: #f87171"
@@ -963,47 +1057,84 @@ elif page == "📦 Products":
                 df_p.style.applymap(highlight_stock, subset=["Stock"]),
                 use_container_width=True, hide_index=True
             )
-            st.caption("⚠️ Buying price is for internal use only — never shown on customer invoices.")
+            st.caption("⚠️ Buying price is internal — never shown on customer invoices.")
 
+    # ── 4. Add / Update Product (smart duplicate check) ──
     with col_right:
-        st.markdown("<div class='section-header'>➕ Add New Product</div>", unsafe_allow_html=True)
-        with st.form("add_product"):
-            p_name = st.text_input("Product Name*")
-            p_brand = st.text_input("Brand")
-            p_category = st.selectbox("Category", [
-                "Protein", "Mass Gainer", "Creatine", "Pre-Workout",
-                "Amino Acids", "Fat Burner", "Vitamins", "Supplements", "Other"
-            ])
-            c1, c2 = st.columns(2)
-            with c1:
-                p_buying = st.number_input("Buying Price (₹)*", min_value=0.0, step=10.0,
-                                           help="Your cost price — never shown on bills")
-            with c2:
-                p_price = st.number_input("Selling Price (₹)*", min_value=0.0, step=10.0,
-                                          help="Price charged to customer")
-            p_stock = st.number_input("Initial Stock*", min_value=0, step=1)
-            p_unit = st.selectbox("Unit", ["unit", "kg", "g", "bottle", "pack"])
-            submitted = st.form_submit_button("➕ Add Product", use_container_width=True, type="primary")
-            if submitted:
-                if p_name and p_price > 0:
-                    db.add_product(p_name, p_brand, p_category, p_buying, p_price, p_stock, p_unit)
-                    st.success(f"✅ '{p_name}' added successfully!")
+        st.markdown("<div class='section-header'>📦 Add / Update Product</div>", unsafe_allow_html=True)
+
+        # Mode toggle
+        prod_mode = st.radio(
+            "Select action",
+            ["✏️ Update Existing Product", "➕ Add New Product"],
+            horizontal=True, key="prod_mode"
+        )
+
+        if prod_mode == "✏️ Update Existing Product" and products:
+            # Build map: deduplicated list sorted by name
+            prod_map = {}
+            for p in products:
+                prod_map[f"{p['name']} ({p['brand']})"] = p
+            sel_key = st.selectbox(
+                "Select product to update",
+                list(prod_map.keys()),
+                key="update_sel"
+            )
+            sel_prod = prod_map[sel_key]
+            with st.form("update_product_form"):
+                st.caption(f"ID: {sel_prod['id']} | Category: {sel_prod['category']}")
+                u1, u2 = st.columns(2)
+                with u1:
+                    u_buying = st.number_input(
+                        "Buying Price (₹)", min_value=0.0, step=10.0,
+                        value=float(sel_prod['buying_price']),
+                        help="Internal cost — never shown on bills"
+                    )
+                with u2:
+                    u_selling = st.number_input(
+                        "Selling Price (₹)", min_value=0.0, step=10.0,
+                        value=float(sel_prod['price'])
+                    )
+                u_stock = st.number_input(
+                    "Stock Qty", min_value=0, step=1, value=int(sel_prod['stock'])
+                )
+                if st.form_submit_button("💾 Update Product", use_container_width=True, type="primary"):
+                    db.update_product(sel_prod['id'], u_buying, u_selling, u_stock)
+                    st.success(f"✅ '{sel_prod['name']}' updated!")
                     st.rerun()
-                else:
-                    st.error("Product name and selling price are required.")
 
-        st.markdown("<div class='section-header'>📦 Update Stock</div>", unsafe_allow_html=True)
-        if products:
-            prod_names = {p["name"]: p for p in products}
-            sel = st.selectbox("Select Product", list(prod_names.keys()), key="stock_sel")
-            new_stock = st.number_input("New Stock Qty", min_value=0, value=int(prod_names[sel]["stock"]))
-            if st.button("💾 Update Stock", use_container_width=True):
-                db.update_product_stock(prod_names[sel]["id"], new_stock)
-                st.success("Stock updated!")
-                st.rerun()
+        elif prod_mode == "➕ Add New Product":
+            with st.form("add_product"):
+                p_name = st.text_input("Product Name*")
+                p_brand = st.text_input("Brand")
+                p_category = st.selectbox("Category", [
+                    "Protein", "Mass Gainer", "Creatine", "Pre-Workout",
+                    "Amino Acids", "Fat Burner", "Vitamins", "Supplements", "Other"
+                ])
+                c1, c2 = st.columns(2)
+                with c1:
+                    p_buying = st.number_input("Buying Price (₹)*", min_value=0.0, step=10.0,
+                                               help="Your cost price — never shown on bills")
+                with c2:
+                    p_price = st.number_input("Selling Price (₹)*", min_value=0.0, step=10.0,
+                                              help="Price charged to customer")
+                p_stock = st.number_input("Initial Stock*", min_value=0, step=1)
+                p_unit = st.selectbox("Unit", ["unit", "kg", "g", "bottle", "pack"])
+                submitted = st.form_submit_button("➕ Add Product", use_container_width=True, type="primary")
+                if submitted:
+                    if p_name and p_price > 0:
+                        # Check for duplicate name
+                        existing_names = [p['name'].lower() for p in products]
+                        if p_name.strip().lower() in existing_names:
+                            st.warning(f"⚠️ '{p_name}' already exists. Use 'Update Existing Product' to modify it.")
+                        else:
+                            db.add_product(p_name, p_brand, p_category, p_buying, p_price, p_stock, p_unit)
+                            st.success(f"✅ '{p_name}' added successfully!")
+                            st.rerun()
+                    else:
+                        st.error("Product name and selling price are required.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # PAGE: CUSTOMERS
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "👥 Customers":
@@ -1040,3 +1171,56 @@ elif page == "👥 Customers":
                     st.rerun()
                 else:
                     st.error("Customer name is required.")
+
+# PAGE: USERS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "👤 Users" and st.session_state.get("role") == "admin":
+    st.markdown("""
+    <div class='main-header'>
+        <h1>👤 User Accounts</h1>
+        <p>The Gain Factory — Manage login credentials and access roles</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    users_list = db.get_all_users()
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.markdown("<div class='section-header'>👤 Active User Accounts</div>", unsafe_allow_html=True)
+        if users_list:
+            df_u = pd.DataFrame(users_list)
+            df_u = df_u[["username", "role", "created_at"]]
+            df_u.columns = ["Username", "Access Role", "Created On"]
+            st.dataframe(df_u, use_container_width=True, hide_index=True)
+            
+            st.markdown("<br><div class='section-header'>🗑️ Delete User Account</div>", unsafe_allow_html=True)
+            non_admin_users = {u["username"]: u for u in users_list if u["username"] != st.session_state.get("username")}
+            if non_admin_users:
+                to_delete = st.selectbox("Select user to delete", list(non_admin_users.keys()))
+                if st.button("🗑️ Delete Account", use_container_width=True, type="primary"):
+                    success, msg = db.delete_user(non_admin_users[to_delete]["id"])
+                    if success:
+                        st.success(f"✅ User '{to_delete}' deleted!")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+            else:
+                st.info("No other user accounts to delete.")
+
+    with col_right:
+        st.markdown("<div class='section-header'>➕ Add New User Account</div>", unsafe_allow_html=True)
+        with st.form("add_user_form"):
+            new_username = st.text_input("Username*")
+            new_password = st.text_input("Password*", type="password")
+            new_role = st.selectbox("Access Role", ["staff", "admin"])
+            submit_user = st.form_submit_button("➕ Create User Account", use_container_width=True, type="primary")
+            if submit_user:
+                if new_username.strip() and new_password.strip():
+                    success = db.add_user(new_username.strip(), new_password.strip(), new_role)
+                    if success:
+                        st.success(f"✅ User account '{new_username}' created successfully!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Username already exists.")
+                else:
+                    st.error("Both username and password are required.")

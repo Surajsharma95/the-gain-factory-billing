@@ -88,6 +88,17 @@ def init_db():
         )
     """)
 
+    # Users table for dashboard logins
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'staff',
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+
     conn.commit()
     conn.close()
     _seed_sample_data()
@@ -129,6 +140,16 @@ def _seed_sample_data():
         cur.executemany(
             "INSERT INTO customers (name, phone, email, address) VALUES (?,?,?,?)",
             customers,
+        )
+
+    # Seed default user admin / gainfactory2024
+    cur.execute("SELECT COUNT(*) FROM users")
+    if cur.fetchone()[0] == 0:
+        import hashlib
+        admin_hash = hashlib.sha256("gainfactory2024".encode()).hexdigest()
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            ("admin", admin_hash, "admin")
         )
 
     conn.commit()
@@ -306,6 +327,52 @@ def update_product_stock(product_id, new_stock):
     conn.close()
 
 
+def update_product(product_id, buying_price, selling_price, stock):
+    """Update buying price, selling price and stock for a single product."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE products SET buying_price=?, price=?, stock=? WHERE id=?",
+        (buying_price, selling_price, int(stock), product_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def bulk_update_products_csv(rows):
+    """
+    Update products from a list of dicts.
+    Each dict must have 'name' and at least one of:
+      buying_price, selling_price (or price), stock
+    Matches by product name (case-insensitive). Returns (updated, skipped) counts.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    updated, skipped = 0, 0
+    for row in rows:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            skipped += 1
+            continue
+        cur.execute("SELECT id, buying_price, price, stock FROM products WHERE LOWER(name)=LOWER(?)", (name,))
+        prod = cur.fetchone()
+        if not prod:
+            skipped += 1
+            continue
+        # Use CSV value if present, else keep existing
+        buying  = float(row["buying_price"])  if "buying_price"  in row and str(row["buying_price"]).strip()  != "" else prod["buying_price"]
+        selling = float(row.get("selling_price") or row.get("price") or prod["price"])
+        stock   = int(float(row["stock"]))     if "stock"         in row and str(row["stock"]).strip()         != "" else prod["stock"]
+        cur.execute(
+            "UPDATE products SET buying_price=?, price=?, stock=? WHERE id=?",
+            (buying, selling, stock, prod["id"])
+        )
+        updated += 1
+    conn.commit()
+    conn.close()
+    return updated, skipped
+
+
 def add_customer(name, phone, email, address):
     conn = get_connection()
     cur = conn.cursor()
@@ -315,6 +382,70 @@ def add_customer(name, phone, email, address):
     """, (name, phone, email, address))
     conn.commit()
     conn.close()
+
+
+# ─── User Management Helpers ──────────────────────────────────────────────────
+
+def add_user(username, password, role="staff"):
+    import hashlib
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            (username.strip(), password_hash, role)
+        )
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    conn.close()
+    return success
+
+
+def get_all_users():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, role, created_at FROM users ORDER BY username")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def delete_user(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    # Ensure we don't delete the last admin
+    cur.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
+    admin_count = cur.fetchone()[0]
+    
+    cur.execute("SELECT role FROM users WHERE id=?", (user_id,))
+    user_role_row = cur.fetchone()
+    if not user_role_row:
+        conn.close()
+        return False, "User not found"
+        
+    role = user_role_row["role"]
+    if role == 'admin' and admin_count <= 1:
+        conn.close()
+        return False, "Cannot delete the only administrator"
+        
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return True, "User deleted successfully"
+
+
+def verify_user(username, password):
+    import hashlib
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ? AND password_hash = ?", (username.strip(), password_hash))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 # Initialize database on import
